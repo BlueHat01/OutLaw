@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.outlaw/
+*.log
+queue.json
+.venv/

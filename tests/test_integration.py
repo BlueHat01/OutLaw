@@ -1,6 +1,10 @@
 # tests/test_integration.py
+import asyncio
+import pytest
 from outlaw.client_net import ClientSession
 from outlaw import protocol as proto
+from outlaw.server import Registry, Router, ServerProtocol
+from outlaw.store import QueueStore
 
 def make_session():
     got = {"msgs": [], "roster": [], "link": []}
@@ -54,3 +58,67 @@ def test_ma_clears_pending():
     assert mid in s._pending
     s.feed({"t": "ma", "id": mid})
     assert mid not in s._pending
+
+@pytest.mark.asyncio
+async def test_two_clients_broadcast_and_dm_over_loopback(tmp_path):
+    loop = asyncio.get_running_loop()
+    reg = Registry()
+    q = QueueStore(tmp_path / "q.json")
+    holder = {}
+    def send(addr, packet):
+        try:
+            holder["t"].sendto(proto.encode(packet), addr)
+        except proto.PacketTooLarge:
+            pass
+    router = Router(reg, q, send)
+    st, _ = await loop.create_datagram_endpoint(
+        lambda: ServerProtocol(router, tmp_path / "d.log"), local_addr=("127.0.0.1", 0))
+    holder["t"] = st
+    server_addr = st.get_extra_info("sockname")
+
+    a_got, b_got = [], []
+    a = ClientSession("a", server_addr,
+        on_message=lambda f, to, x, ts: a_got.append((f, x)),
+        on_roster=lambda u: None, on_link=lambda up: None)
+    b = ClientSession("b", server_addr,
+        on_message=lambda f, to, x, ts: b_got.append((f, x)),
+        on_roster=lambda u: None, on_link=lambda up: None)
+    await a.start(); await b.start()
+    await asyncio.sleep(0.2)                 # let registrations land
+
+    a.send_text("__all__", "hello loop")
+    await asyncio.sleep(0.2)
+    assert ("a", "hello loop") in b_got      # broadcast reached b, not echoed to a
+
+    b.send_text("a", "secret dm")
+    await asyncio.sleep(0.2)
+    assert ("b", "secret dm") in a_got
+
+    a.close(); b.close(); st.close()
+
+@pytest.mark.asyncio
+async def test_offline_then_reconnect_delivery(tmp_path):
+    loop = asyncio.get_running_loop()
+    reg = Registry(); q = QueueStore(tmp_path / "q.json")
+    holder = {}
+    def send(addr, packet):
+        holder["t"].sendto(proto.encode(packet), addr)
+    router = Router(reg, q, send)
+    st, _ = await loop.create_datagram_endpoint(
+        lambda: ServerProtocol(router, tmp_path / "d.log"), local_addr=("127.0.0.1", 0))
+    holder["t"] = st
+    server_addr = st.get_extra_info("sockname")
+
+    a = ClientSession("a", server_addr,
+        on_message=lambda *x: None, on_roster=lambda u: None, on_link=lambda up: None)
+    await a.start(); await asyncio.sleep(0.1)
+    a.send_text("bob", "you were away")     # bob offline -> queued
+    await asyncio.sleep(0.1)
+
+    bob_got = []
+    bob = ClientSession("bob", server_addr,
+        on_message=lambda f, to, x, ts: bob_got.append((f, x)),
+        on_roster=lambda u: None, on_link=lambda up: None)
+    await bob.start(); await asyncio.sleep(0.2)   # register triggers queue flush
+    assert ("a", "you were away") in bob_got
+    a.close(); bob.close(); st.close()

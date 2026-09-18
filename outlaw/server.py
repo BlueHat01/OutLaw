@@ -67,6 +67,11 @@ class Router:
             nick = packet.get("f")
             if not nick:
                 return
+            owner = self.reg.addr_of(nick)
+            if owner is not None and owner != addr:
+                # Nick already owned by a different, still-live client.
+                self.send(addr, {"t": "err", "m": "nick taken"})
+                return
             self.reg.register(nick, addr, now)
             self.send(addr, {"t": "ack", "on": self.reg.online()})
             self._broadcast_online()

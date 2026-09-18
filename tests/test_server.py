@@ -89,6 +89,30 @@ def test_dm_to_offline_is_queued_then_flushed(tmp_path):
     assert flushed and flushed[0]["id"] == "y"
 
 
+# I1: nick-collision handling
+def test_duplicate_nick_from_different_addr_is_rejected(tmp_path):
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    sink.sent.clear()
+    router.handle({"t": "reg", "f": "a"}, ("2.2.2.2", 2), now=1)
+    errs = [(a, p) for a, p in sink.sent if p.get("t") == "err"]
+    assert errs and errs[0][0] == ("2.2.2.2", 2)
+    assert errs[0][1]["m"] == "nick taken"
+    # addr1 still owns the nick; addr2 was not registered.
+    assert reg.addr_of("a") == ("1.1.1.1", 1)
+    assert reg.nick_of(("2.2.2.2", 2)) is None
+
+
+def test_reregister_same_addr_succeeds(tmp_path):
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    sink.sent.clear()
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=5)
+    assert not any(p.get("t") == "err" for a, p in sink.sent)
+    assert any(p.get("t") == "ack" for a, p in sink.sent)
+    assert reg.addr_of("a") == ("1.1.1.1", 1)
+
+
 # Task 7: ServerProtocol tests
 def test_protocol_decodes_and_routes(tmp_path):
     router, reg, q, sink = make_router(tmp_path)

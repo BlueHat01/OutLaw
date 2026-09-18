@@ -46,6 +46,21 @@ OUTLAW_SERVER=10.0.0.1 python3 client.py
 
 When prompted, enter your alias (nick).
 
+#### Line-mode client (recommended on Termux)
+
+The full-screen Textual UI (`client.py`) depends on the terminal correctly
+handling Textual's capability handshake. Some Termux terminals don't, which
+shows up as stray/gibberish characters in the input and a UI stuck at
+`LINK DOWN` even when the network is fine. If you hit that, use the line-mode
+client instead — same server, same protocol, same commands, plain scrolling
+output, no Textual:
+
+```bash
+OUTLAW_SERVER=10.0.0.1 python3 client_cli.py
+```
+
+It needs no extra dependencies beyond the Python standard library.
+
 ## Environment Variables
 
 - `OUTLAW_SERVER` — server address (default: `10.0.0.1`)

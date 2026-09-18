@@ -1,7 +1,6 @@
 # client.py
 import asyncio
 import os
-import sys
 from pathlib import Path
 from outlaw.store import Config
 from outlaw.client_net import ClientSession
@@ -23,16 +22,21 @@ async def main():
     tunnel_ip = os.environ.get("OUTLAW_IP", "dns0")
     app = OutlawApp(session=None, nick=nick, tunnel_ip=tunnel_ip,
                     history_path=DATA_DIR / "history.log")
+    # Callbacks fire on the same asyncio loop Textual runs on, so call the app
+    # methods directly (no call_from_thread). The session is started from
+    # OutlawApp.on_mount so widgets already exist when packets arrive.
     session = ClientSession(
         nick, SERVER,
-        on_message=lambda f, to, x, ts: app.call_from_thread(app.show_message, f, to, x, ts),
-        on_roster=lambda users: app.call_from_thread(app.set_roster, users),
-        on_link=lambda up: app.call_from_thread(app.set_link, up),
+        on_message=app.show_message,
+        on_roster=app.set_roster,
+        on_link=app.set_link,
+        on_error=app.show_system,
     )
     app.session = session
-    await session.start()
-    await app.run_async()
-    session.close()
+    try:
+        await app.run_async()
+    finally:
+        session.close()
 
 if __name__ == "__main__":
     try:

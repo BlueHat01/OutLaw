@@ -1,7 +1,9 @@
 # outlaw/ui.py
+import asyncio
 from datetime import datetime
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import Header, Footer, Input, RichLog, Static
 from outlaw.commands import parse_input
 from outlaw import protocol as proto, store
@@ -49,6 +51,13 @@ class OutlawApp(App):
             log.write(f"[#00ff41]{line}[/]")
         log.write("[#666666]> establishing tunnel ...[/]")
         self.query_one("#entry", Input).focus()
+        # Start the network session now that widgets are mounted, so early
+        # inbound packets can safely update the UI.
+        if self.session is not None:
+            if hasattr(self, "run_worker"):
+                self.run_worker(self.session.start())
+            else:
+                asyncio.create_task(self.session.start())
 
     def _status_text(self):
         mode = "group" if self.mode[0] == "group" else f"dm:{self.mode[1]}"
@@ -109,14 +118,29 @@ class OutlawApp(App):
         self.rx += 1
         stamp = datetime.now().strftime("%H:%M")
         tag = "" if to == "__all__" else " » you"
-        self.query_one("#stream", RichLog).write(f"[#00ff41]{stamp} {frm}{tag}  {text}[/]")
+        try:
+            self.query_one("#stream", RichLog).write(f"[#00ff41]{stamp} {frm}{tag}  {text}[/]")
+        except NoMatches:
+            return
         store.append_line(self.history_path, f"{stamp} {frm}{tag}: {text}")
         self._refresh_status()
 
     def set_roster(self, users):
         lines = "\n".join(f"[#00ff41]●[/] {u}" if u != self.nick else f"[#ffb000]●[/] {u} (you)" for u in users)
-        self.query_one("#peers", Static).update(f"PEERS\n\n{lines}\n\n{len(users)} online")
+        try:
+            self.query_one("#peers", Static).update(f"PEERS\n\n{lines}\n\n{len(users)} online")
+        except NoMatches:
+            return
 
     def set_link(self, up):
         self.link_up = up
-        self._refresh_status()
+        try:
+            self._refresh_status()
+        except NoMatches:
+            return
+
+    def show_system(self, text):
+        try:
+            self.query_one("#stream", RichLog).write(f"[#ffb000]! {text}[/]")
+        except NoMatches:
+            return

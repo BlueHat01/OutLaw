@@ -13,7 +13,7 @@ class ClientSession:
         self.on_link = on_link
         self.on_error = on_error
         self.transport = None
-        self._pending = {}       # mid -> {"packets": [pkt, ...], "tries": int, "at": ts}
+        self._pending = {}       # mid -> {"packets": {n: pkt}, "tries": int, "at": ts, "acked": set(n)}
         self._dupes = proto.DuplicateFilter()
         self._reasm = proto.ChunkReassembler()
         self._link_up = False
@@ -41,7 +41,12 @@ class ClientSession:
                 self._link_up = True
                 self.on_link(True)
         elif t == "ma":
-            self._pending.pop(packet.get("id"), None)
+            mid = packet.get("id")
+            e = self._pending.get(mid)
+            if e is not None:
+                e["acked"].add(packet.get("n"))
+                if len(e["acked"]) >= len(e["packets"]):
+                    del self._pending[mid]
         elif t == "err":
             if self.on_error is not None:
                 self.on_error(packet.get("m", ""))
@@ -64,7 +69,12 @@ class ClientSession:
         for n, chunk in enumerate(chunks):
             pkt = proto.make_msg(self.nick, to, chunk, mid, n, total, proto.now_ts())
             packets.append(pkt)
-        self._pending[mid] = {"packets": packets, "tries": 0, "at": proto.now_ts()}
+        self._pending[mid] = {
+            "packets": {n: pkt for n, pkt in enumerate(packets)},
+            "tries": 0,
+            "at": proto.now_ts(),
+            "acked": set(),
+        }
         for pkt in packets:
             self._raw_send(pkt)
 
@@ -83,20 +93,23 @@ class ClientSession:
             await asyncio.sleep(30)
             self._raw_send({"t": "pi", "f": self.nick})
 
+    def _sweep(self, now):
+        self._reasm.purge(now)
+        for mid, e in list(self._pending.items()):
+            if now - e["at"] >= 2:
+                if e["tries"] >= 3:
+                    del self._pending[mid]
+                else:
+                    e["tries"] += 1
+                    e["at"] = now
+                    for n, pkt in e["packets"].items():
+                        if n not in e["acked"]:
+                            self._raw_send(pkt)
+
     async def _retransmit_loop(self):
         while not self._closing:
             await asyncio.sleep(2)
-            now = proto.now_ts()
-            self._reasm.purge(now)
-            for mid, e in list(self._pending.items()):
-                if now - e["at"] >= 2:
-                    if e["tries"] >= 3:
-                        del self._pending[mid]
-                    else:
-                        e["tries"] += 1
-                        e["at"] = now
-                        for pkt in e["packets"]:
-                            self._raw_send(pkt)
+            self._sweep(proto.now_ts())
 
     def _check_link(self, now):
         # Watchdog: if no inbound traffic for LINK_TIMEOUT while we think the

@@ -96,6 +96,35 @@ def test_ma_clears_pending():
     s.feed({"t": "ma", "id": mid})
     assert mid not in s._pending
 
+
+def test_ma_per_chunk_ack_only_resends_unacked_chunks():
+    # C2 regression: a multi-chunk message must not be dropped from _pending
+    # until EVERY chunk's ack (carrying its own "n") has been seen. A lost
+    # chunk must still be retransmitted on the next sweep.
+    s, got, sent = make_session()
+    s.send_text("__all__", "a" * 350)
+    msgs = [p for p in sent if p["t"] == "m"]
+    mid = msgs[0]["id"]
+    assert len({p["id"] for p in msgs}) == 1
+    assert msgs[0]["c"] >= 3
+    assert len(msgs) >= 3
+
+    # Server acks chunks 0 and 2, but chunk 1 is lost in transit.
+    s.feed({"t": "ma", "id": mid, "n": 0})
+    s.feed({"t": "ma", "id": mid, "n": 2})
+    assert mid in s._pending    # not dropped: chunk 1 still unacked
+
+    sent.clear()
+    s._pending[mid]["at"] = 0   # force the entry to look overdue
+    s._sweep(proto.now_ts())
+
+    resent = [p for p in sent if p["t"] == "m"]
+    assert len(resent) == 1
+    assert resent[0]["n"] == 1
+
+    s.feed({"t": "ma", "id": mid, "n": 1})
+    assert mid not in s._pending
+
 @pytest.mark.asyncio
 async def test_two_clients_broadcast_and_dm_over_loopback(tmp_path):
     loop = asyncio.get_running_loop()

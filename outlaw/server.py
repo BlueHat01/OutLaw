@@ -85,7 +85,7 @@ class Router:
             self._broadcast_online()
         elif t == "m":
             self.reg.touch(packet.get("f"), now)
-            self.send(addr, {"t": "ma", "id": packet.get("id")})
+            self.send(addr, {"t": "ma", "id": packet.get("id"), "n": packet.get("n")})
             to = packet.get("to")
             if to == proto.BROADCAST:
                 for nick in self.reg.online():

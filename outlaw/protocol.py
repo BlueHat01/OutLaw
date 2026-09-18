@@ -1,7 +1,7 @@
 import json
 import time
 import uuid
-from collections import OrderedDict, deque
+from collections import deque
 
 MAX_DATAGRAM = 230
 TEXT_CAP = 140

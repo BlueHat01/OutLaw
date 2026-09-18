@@ -3,18 +3,22 @@ import asyncio
 from outlaw import protocol as proto
 
 class ClientSession:
-    def __init__(self, nick, server_addr, on_message, on_roster, on_link):
+    LINK_TIMEOUT = 90            # seconds without inbound => link considered down
+
+    def __init__(self, nick, server_addr, on_message, on_roster, on_link, on_error=None):
         self.nick = nick
         self.server_addr = server_addr
         self.on_message = on_message
         self.on_roster = on_roster
         self.on_link = on_link
+        self.on_error = on_error
         self.transport = None
-        self._pending = {}       # id -> {"packet": pkt, "tries": int, "at": ts}
+        self._pending = {}       # mid -> {"packets": [pkt, ...], "tries": int, "at": ts}
         self._dupes = proto.DuplicateFilter()
         self._reasm = proto.ChunkReassembler()
         self._link_up = False
         self._closing = False
+        self._last_rx = proto.now_ts()
 
     # --- transport seam (overridden in tests) ---
     def _raw_send(self, packet):
@@ -26,6 +30,7 @@ class ClientSession:
     # --- inbound ---
     def feed(self, packet):
         t = packet.get("t")
+        self._last_rx = proto.now_ts()
         if t == "ack":
             if not self._link_up:
                 self._link_up = True
@@ -37,6 +42,9 @@ class ClientSession:
                 self.on_link(True)
         elif t == "ma":
             self._pending.pop(packet.get("id"), None)
+        elif t == "err":
+            if self.on_error is not None:
+                self.on_error(packet.get("m", ""))
         elif t == "m":
             mid = packet.get("id")
             self._raw_send({"t": "ma", "id": mid})
@@ -49,11 +57,15 @@ class ClientSession:
 
     # --- outbound ---
     def send_text(self, to, text):
-        for n, chunk in enumerate(proto.chunk_text(text)):
-            mid = proto.new_id()
-            total = len(proto.chunk_text(text))
+        chunks = proto.chunk_text(text)
+        total = len(chunks)
+        mid = proto.new_id()
+        packets = []
+        for n, chunk in enumerate(chunks):
             pkt = proto.make_msg(self.nick, to, chunk, mid, n, total, proto.now_ts())
-            self._pending[mid] = {"packet": pkt, "tries": 0, "at": proto.now_ts()}
+            packets.append(pkt)
+        self._pending[mid] = {"packets": packets, "tries": 0, "at": proto.now_ts()}
+        for pkt in packets:
             self._raw_send(pkt)
 
     def register(self):
@@ -75,6 +87,7 @@ class ClientSession:
         while not self._closing:
             await asyncio.sleep(2)
             now = proto.now_ts()
+            self._reasm.purge(now)
             for mid, e in list(self._pending.items()):
                 if now - e["at"] >= 2:
                     if e["tries"] >= 3:
@@ -82,7 +95,20 @@ class ClientSession:
                     else:
                         e["tries"] += 1
                         e["at"] = now
-                        self._raw_send(e["packet"])
+                        for pkt in e["packets"]:
+                            self._raw_send(pkt)
+
+    def _check_link(self, now):
+        # Watchdog: if no inbound traffic for LINK_TIMEOUT while we think the
+        # link is up, mark it down so _register_retry_loop resumes re-registering.
+        if self._link_up and now - self._last_rx > self.LINK_TIMEOUT:
+            self._link_up = False
+            self.on_link(False)
+
+    async def _watchdog_loop(self):
+        while not self._closing:
+            await asyncio.sleep(3)
+            self._check_link(proto.now_ts())
 
     async def _register_retry_loop(self):
         while not self._closing:
@@ -107,6 +133,7 @@ class ClientSession:
         asyncio.create_task(self._ping_loop())
         asyncio.create_task(self._retransmit_loop())
         asyncio.create_task(self._register_retry_loop())
+        asyncio.create_task(self._watchdog_loop())
 
     def close(self):
         self._closing = True

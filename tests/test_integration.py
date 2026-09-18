@@ -51,6 +51,43 @@ def test_send_reassembles_multichunk_on_feed():
         s.feed({"t": "m", "id": mid, "f": "alice", "to": "rahul", "x": part, "s": 1, "n": n, "c": 2})
     assert got["msgs"][-1] == ("alice", "rahul", "foobar", 1)
 
+def test_multichunk_shares_one_id_and_reassembles_end_to_end():
+    # C2: a >140-byte message must be sent as chunks that all share ONE id,
+    # with c == n_chunks and n covering 0..n-1, and must reassemble on the peer.
+    s, got, sent = make_session()
+    text = "".join(chr(ord("a") + (i % 26)) for i in range(400))  # 400 bytes ASCII
+    s.send_text("__all__", text)
+    msgs = [p for p in sent if p["t"] == "m"]
+    n_chunks = len(proto.chunk_text(text))
+    assert n_chunks > 1
+    assert len(msgs) == n_chunks
+    ids = {p["id"] for p in msgs}
+    assert len(ids) == 1                              # ALL chunks share one id
+    assert all(p["c"] == n_chunks for p in msgs)      # c == n_chunks
+    assert {p["n"] for p in msgs} == set(range(n_chunks))  # n covers 0..n-1
+
+    # Feed the exact emitted packets, scrambled, into a fresh receiving session.
+    recv, rgot, rsent = make_session()
+    scrambled = list(reversed(msgs))
+    for pkt in scrambled:
+        recv.feed(pkt)
+    assert rgot["msgs"][-1][2] == text                # reassembled original text
+
+
+def test_watchdog_marks_link_down_after_timeout():
+    # I3: no inbound for > LINK_TIMEOUT while link is up -> on_link(False).
+    s, got, sent = make_session()
+    s.feed({"t": "ack", "on": ["rahul"]})             # brings link up, sets _last_rx
+    assert s._link_up is True
+    assert got["link"][-1] is True
+
+    now = proto.now_ts()
+    s._last_rx = now - (s.LINK_TIMEOUT + 5)            # simulate old last activity
+    s._check_link(now)
+    assert s._link_up is False
+    assert got["link"][-1] is False
+
+
 def test_ma_clears_pending():
     s, got, sent = make_session()
     s.send_text("alice", "hey")

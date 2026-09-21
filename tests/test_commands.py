@@ -29,3 +29,17 @@ def test_unknown_command_is_error():
 
 def test_dm_without_arg_is_error():
     assert parse_input("/dm")["kind"] == "error"
+
+def test_img_command():
+    assert parse_input("/img /sdcard/pic.jpg") == {"kind": "img", "path": "/sdcard/pic.jpg"}
+
+def test_img_requires_path():
+    assert parse_input("/img")["kind"] == "error"
+
+def test_open_defaults_to_last():
+    assert parse_input("/open") == {"kind": "open", "arg": "last"}
+    assert parse_input("/open 3f9") == {"kind": "open", "arg": "3f9"}
+
+def test_history_default_and_arg():
+    assert parse_input("/history") == {"kind": "history", "n": 20}
+    assert parse_input("/history 50") == {"kind": "history", "n": 50}

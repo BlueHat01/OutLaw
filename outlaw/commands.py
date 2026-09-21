@@ -30,4 +30,15 @@ def parse_input(text: str) -> dict:
         if len(bits) < 2 or not bits[1].strip():
             return {"kind": "error", "msg": "usage: /msg <nick> <text>"}
         return {"kind": "oneoff_dm", "nick": bits[0], "text": bits[1].strip()}
+    if cmd == "img":
+        if not rest:
+            return {"kind": "error", "msg": "usage: /img <path>"}
+        return {"kind": "img", "path": rest.strip()}
+    if cmd == "open":
+        return {"kind": "open", "arg": rest.split(" ", 1)[0] if rest else "last"}
+    if cmd == "history":
+        n = 20
+        if rest.strip().isdigit():
+            n = int(rest.strip())
+        return {"kind": "history", "n": n}
     return {"kind": "error", "msg": f"unknown command: /{cmd}"}

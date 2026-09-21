@@ -54,9 +54,28 @@ im  {"t":"im","id":"3f9","n":42,"c":210,"d":"<base64 slice>"}
 
 ### 1.2 Compression (sender)
 
-- Uses **Pillow**. Downscale so the longest edge ≤ 800px; re-encode JPEG,
-  lowering quality until the encoded size ≤ **24 KB** (floor quality guard).
-- Constants: `IMAGE_MAX_EDGE = 800`, `IMAGE_MAX_BYTES = 24576`.
+Uses **Pillow**. Every image is auto-compressed on send regardless of its
+original size; the on-the-wire result is always ≤ `IMAGE_MAX_BYTES`.
+
+**Input guard.** Before loading, if the source file is larger than
+`IMAGE_MAX_INPUT_BYTES` (25 MB), `/img` refuses with a clear message and loads
+nothing — this prevents an out-of-memory spike from a huge original on a phone.
+
+**Guaranteed-fit algorithm.** Convert to RGB, then iterate until the encoded
+JPEG is ≤ `IMAGE_MAX_BYTES`:
+
+1. Start with the longest edge capped at `IMAGE_MAX_EDGE` (800px).
+2. At the current edge, try JPEG quality from `IMAGE_START_QUALITY` (85) down to
+   `IMAGE_MIN_QUALITY` (30); if any encoding is ≤ budget, use it.
+3. If none fit, reduce the edge (× 0.8) and repeat, down to `IMAGE_MIN_EDGE`
+   (240px).
+4. At `IMAGE_MIN_EDGE` + `IMAGE_MIN_QUALITY` a JPEG is a few KB, so this
+   effectively always fits; in the pathological case it still doesn't, `/img`
+   fails with a clear message rather than sending an oversize image.
+
+- Constants: `IMAGE_MAX_BYTES = 24576`, `IMAGE_MAX_EDGE = 800`,
+  `IMAGE_MIN_EDGE = 240`, `IMAGE_START_QUALITY = 85`, `IMAGE_MIN_QUALITY = 30`,
+  `IMAGE_MAX_INPUT_BYTES = 26214400`.
 - If Pillow is not installed, `/img` fails with a clear message and sends
   nothing (never sends a multi-MB original).
 
@@ -177,8 +196,10 @@ hole.
 
 - **protocol:** `ih`/`im` encode/decode ≤ 230; base64 chunk round-trip; image
   reassembly → original bytes; transfer purge timeout.
-- **media:** compression hits ≤ 24 KB / ≤ 800px on a generated image; Pillow-absent
-  path fails cleanly (guarded/skipped).
+- **media:** compression hits ≤ 24 KB / ≤ 800px on a generated image; the
+  iterative downscale still fits a deliberately hard-to-compress (large, noisy)
+  image by stepping the edge down; the 25 MB input guard rejects an oversize
+  source; Pillow-absent path fails cleanly (guarded/skipped).
 - **sender windowing:** ≤ window chunks in flight; acks release more.
 - **reliable delivery:** recipient acks → cleared; no ack → requeued + evicted
   after retries; **regression test reproducing the multi-message-offline loss**

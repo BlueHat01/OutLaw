@@ -75,3 +75,14 @@ def test_save_image_writes_file(tmp_path):
     assert p.exists()
     assert p.read_bytes() == b"\xff\xd8\xff"
     assert p.name == "alice-3f9.jpg"
+
+# NEW-5: /open <id> resolution
+def test_find_image_resolves_id(tmp_path):
+    path = media.save_image(tmp_path, "alice", "abc", "image/jpeg", b"\xff\xd8\xff")
+    assert media.find_image(tmp_path, "abc") == path          # <from>-<id>.<ext>
+    assert media.find_image(tmp_path, "zzz") is None           # unknown id
+    assert media.find_image(tmp_path / "nope", "abc") is None  # missing dir
+
+# NEW-9: open_image must not report success for a missing file
+def test_open_image_missing_file_returns_false(tmp_path):
+    assert media.open_image(tmp_path / "does-not-exist.jpg") is False

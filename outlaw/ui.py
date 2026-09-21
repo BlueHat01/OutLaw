@@ -128,7 +128,10 @@ class OutlawApp(App):
             except ImageError as e:
                 log.write(f"[#ff3333]! {e}[/]")
         elif kind == "open":
-            target = self.last_image if action["arg"] == "last" else action["arg"]
+            if action["arg"] == "last":
+                target = self.last_image
+            else:
+                target = media.find_image(Path.home() / ".outlaw" / "media", action["arg"])
             if target and media.open_image(target):
                 log.write(f"[#666666]* opening {target}[/]")
             else:

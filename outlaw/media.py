@@ -76,7 +76,18 @@ def save_image(media_dir, frm, mid, mime, data) -> str:
     path.write_bytes(data)
     return str(path)
 
+def find_image(media_dir, mid):
+    """Resolve a transfer id to its saved file (<from>-<mid>.<ext>)."""
+    d = Path(media_dir)
+    if not d.exists():
+        return None
+    for p in sorted(d.glob(f"*-{mid}.*")):
+        return str(p)
+    return None
+
 def open_image(path) -> bool:
+    if not os.path.exists(str(path)):
+        return False
     for launcher in ("termux-open", "xdg-open"):
         if shutil.which(launcher):
             try:

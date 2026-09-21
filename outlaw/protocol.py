@@ -6,6 +6,7 @@ from collections import deque
 MAX_DATAGRAM = 230
 TEXT_CAP = 140
 BROADCAST = "__all__"
+MAX_NICK = 20
 
 class PacketTooLarge(Exception):
     pass
@@ -103,9 +104,9 @@ class ImageAssembler:
             self._t[mid] = e
         return e
 
-    def add_header(self, mid, frm, name, mime, size, now):
+    def add_header(self, mid, frm, to, name, mime, size, now):
         e = self._entry(mid, now)
-        e["meta"] = {"frm": frm, "name": name, "mime": mime, "size": size}
+        e["meta"] = {"frm": frm, "to": to, "name": name, "mime": mime, "size": size}
 
     def add_chunk(self, mid, n, count, data_slice, now):
         e = self._entry(mid, now)
@@ -113,10 +114,11 @@ class ImageAssembler:
         e["chunks"][n] = data_slice
         if e["c"] is not None and len(e["chunks"]) == e["c"]:
             slices = [e["chunks"][i] for i in range(e["c"])]
-            meta = e["meta"] or {"frm": "peer", "name": "image", "mime": "image/jpeg", "size": None}
+            meta = e["meta"] or {"frm": "peer", "to": None, "name": "image",
+                                 "mime": "image/jpeg", "size": None}
             del self._t[mid]
-            return {"slices": slices, "frm": meta["frm"], "name": meta["name"],
-                    "mime": meta["mime"], "size": meta["size"]}
+            return {"slices": slices, "frm": meta["frm"], "to": meta.get("to"),
+                    "name": meta["name"], "mime": meta["mime"], "size": meta["size"]}
         return None
 
     def purge(self, now):

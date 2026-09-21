@@ -284,6 +284,46 @@ def test_send_image_stall_retransmits_unacked_chunks(tmp_path):
     assert mid not in s._img_tx
 
 
+def test_send_image_resends_header_until_acked(tmp_path):
+    # NEW-1: if the header ack (n=-1) is never seen, a stalled transfer must
+    # resend the "ih" header (not just data chunks). Once acked, it stops.
+    from outlaw.client_net import ClientSession
+    from PIL import Image
+    src = tmp_path / "h.png"; Image.new("RGB", (1000, 800), (1, 2, 3)).save(src)
+    s = ClientSession("alice", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    s.send_image("bob", str(src))
+    mid = [p for p in sent if p["t"] == "ih"][0]["id"]
+    assert s._img_tx[mid]["header_acked"] is False
+
+    # Ignore the header ack; force a stall and observe a fresh retransmit.
+    sent.clear()
+    s._img_tx[mid]["at"] = 0
+    s._sweep(proto.now_ts())
+    assert any(p["t"] == "ih" and p["id"] == mid for p in sent), "header must be resent while unacked"
+
+    # Once the header is acked (n=-1) it is no longer resent.
+    s.feed({"t": "ma", "id": mid, "n": -1})
+    assert s._img_tx[mid]["header_acked"] is True
+    sent.clear()
+    s._img_tx[mid]["at"] = 0
+    s._sweep(proto.now_ts())
+    assert not any(p["t"] == "ih" for p in sent)
+
+
+def test_long_nick_is_truncated():
+    # NEW-7: bound nick length so ih/m packets stay under the datagram cap.
+    long_s = ClientSession("x" * 100, ("10.0.0.1", 5005),
+                           on_message=lambda *a: None, on_roster=lambda u: None,
+                           on_link=lambda up: None)
+    assert len(long_s.nick) == proto.MAX_NICK
+    long_s._raw_send = lambda pkt: None
+    long_s.set_nick("y" * 80)
+    assert len(long_s.nick) == proto.MAX_NICK
+
+
 # --- Task 15: end-to-end image transfer over a real loopback server ---
 
 @pytest.mark.asyncio

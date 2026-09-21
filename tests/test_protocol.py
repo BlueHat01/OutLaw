@@ -90,17 +90,25 @@ def test_img_header_with_long_name_still_encodes():
 
 def test_image_assembler_completes_with_header():
     a = p.ImageAssembler()
-    a.add_header("3f9", "alice", "pic.jpg", "image/jpeg", 300, now=0)
+    a.add_header("3f9", "alice", "bob", "pic.jpg", "image/jpeg", 300, now=0)
     assert a.add_chunk("3f9", 0, 2, "AA", now=0) is None
     out = a.add_chunk("3f9", 1, 2, "BB", now=0)
     assert out["slices"] == ["AA", "BB"]
     assert out["frm"] == "alice" and out["name"] == "pic.jpg" and out["mime"] == "image/jpeg"
+    assert out["to"] == "bob"  # header "to" threaded through so group vs DM is known
+
+def test_image_assembler_group_header_carries_broadcast_to():
+    a = p.ImageAssembler()
+    a.add_header("g1", "alice", "__all__", "pic.jpg", "image/jpeg", 4, now=0)
+    out = a.add_chunk("g1", 0, 1, "AA", now=0)
+    assert out["to"] == "__all__"
 
 def test_image_assembler_completes_without_header_uses_defaults():
     a = p.ImageAssembler()
     out = a.add_chunk("z1", 0, 1, "AA", now=0)
     assert out["slices"] == ["AA"]
     assert out["mime"] == "image/jpeg" and out["frm"] == "peer"  # defaults when header missing
+    assert out["to"] is None  # unknown recipient when no header
 
 def test_image_assembler_purges_stale():
     a = p.ImageAssembler(timeout=120)

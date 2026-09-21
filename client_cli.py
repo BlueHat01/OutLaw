@@ -115,7 +115,10 @@ class CliChat:
             except ImageError as e:
                 self.out(f"{RED}! {e}{X}")
         elif k == "open":
-            target = self.last_image if act["arg"] == "last" else act["arg"]
+            if act["arg"] == "last":
+                target = self.last_image
+            else:
+                target = media.find_image(DATA_DIR / "media", act["arg"])
             if target and media.open_image(target):
                 self.out(f"{D}* opening {target}{X}")
             else:

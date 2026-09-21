@@ -9,7 +9,7 @@ class ClientSession:
 
     def __init__(self, nick, server_addr, on_message, on_roster, on_link, on_error=None,
                  on_image=None, media_dir=None):
-        self.nick = nick
+        self.nick = (nick or "")[:proto.MAX_NICK]
         self.server_addr = server_addr
         self.on_message = on_message
         self.on_roster = on_roster
@@ -59,7 +59,9 @@ class ClientSession:
             tx = self._img_tx.get(mid)
             if tx is not None:
                 n = packet.get("n")
-                if n is not None and n >= 0:
+                if n == -1:
+                    tx["header_acked"] = True
+                elif n is not None and n >= 0:
                     tx["acked"].add(n)
                 tx["at"] = proto.now_ts()
                 if len(tx["acked"]) >= len(tx["chunks"]):
@@ -80,8 +82,9 @@ class ClientSession:
                 self.on_message(packet.get("f"), packet.get("to"), full, packet.get("s"))
         elif t == "ih":
             self._raw_send({"t": "ma", "id": packet.get("id"), "n": -1})
-            self._img.add_header(packet.get("id"), packet.get("f"), packet.get("nm"),
-                                 packet.get("mt"), packet.get("sz"), proto.now_ts())
+            self._img.add_header(packet.get("id"), packet.get("f"), packet.get("to"),
+                                 packet.get("nm"), packet.get("mt"), packet.get("sz"),
+                                 proto.now_ts())
         elif t == "im":
             mid = packet.get("id")
             self._raw_send({"t": "ma", "id": mid, "n": packet.get("n")})
@@ -90,7 +93,7 @@ class ClientSession:
             if done is not None and self.on_image is not None:
                 data = media.join_b64(done["slices"])
                 path = media.save_image(self.media_dir, done["frm"], mid, done["mime"], data)
-                self.on_image(done["frm"], None, path, done)
+                self.on_image(done["frm"], done.get("to"), path, done)
 
     # --- outbound ---
     def send_text(self, to, text):
@@ -114,7 +117,7 @@ class ClientSession:
         self._raw_send({"t": "reg", "f": self.nick})
 
     def set_nick(self, name):
-        self.nick = name
+        self.nick = (name or "")[:proto.MAX_NICK]
         self.register()
 
     def leave(self):
@@ -134,7 +137,8 @@ class ClientSession:
         header = proto.make_img_header(self.nick, to, mid, len(slices), name, mime, len(data), proto.now_ts())
         chunks = {n: proto.make_img_chunk(mid, n, len(slices), sl) for n, sl in enumerate(slices)}
         self._img_tx[mid] = {"to": to, "header": header, "chunks": chunks,
-                             "acked": set(), "sent": set(), "at": proto.now_ts()}
+                             "acked": set(), "sent": set(), "at": proto.now_ts(),
+                             "header_acked": False}
         self._raw_send(header)
         self._img_advance(mid)
         return len(slices)
@@ -172,6 +176,8 @@ class ClientSession:
                     del self._img_tx[mid]
                 else:
                     tx["at"] = now
+                    if not tx.get("header_acked"):
+                        self._raw_send(tx["header"])
                     for n in sorted(tx["sent"]):
                         if n not in tx["acked"]:
                             self._raw_send(tx["chunks"][n])

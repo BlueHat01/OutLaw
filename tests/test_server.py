@@ -187,3 +187,39 @@ def test_offline_image_grouped_and_flushed(tmp_path):
     router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=2)
     kinds = [pk["t"] for ad, pk in sink.sent if ad == ("2.2.2.2", 2) and pk.get("t") in ("ih", "im")]
     assert kinds.count("ih") == 1 and kinds.count("im") == 2
+
+
+# NEW-1: an "im" for an unknown transfer (no prior "ih") must not be acked or
+# delivered; once the header arrives, a subsequent "im" is acked and delivered.
+def test_im_without_header_not_acked_then_routed_after_header(tmp_path):
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=0)
+    sink.sent.clear()
+    # header-less "im" for an unknown id: no route -> no ack, no delivery
+    router.handle({"t": "im", "id": "img7", "n": 0, "c": 1, "d": "AAA"}, ("1.1.1.1", 1), now=1)
+    assert not any(p.get("t") == "ma" and p.get("id") == "img7" for a, p in sink.sent)
+    assert not any(p.get("t") == "im" for a, p in sink.sent)
+    # header lands, populating the route
+    router.handle({"t": "ih", "id": "img7", "f": "a", "to": "b", "c": 1,
+                   "nm": "p.jpg", "mt": "image/jpeg", "sz": 3, "s": 1}, ("1.1.1.1", 1), now=1)
+    sink.sent.clear()
+    router.handle({"t": "im", "id": "img7", "n": 0, "c": 1, "d": "AAA"}, ("1.1.1.1", 1), now=1)
+    assert any(p.get("t") == "ma" and p.get("id") == "img7" for a, p in sink.sent)  # sender acked
+    assert any(ad == ("2.2.2.2", 2) and p.get("t") == "im" for ad, p in sink.sent)  # delivered to b
+
+
+# NEW-2: a still-live client evicted by delivery failure must re-register on ping.
+def test_ping_reregisters_evicted_live_client(tmp_path):
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=0)
+    router.handle({"t": "m", "id": "x", "f": "a", "to": "b", "x": "hi", "s": 1, "n": 0, "c": 1},
+                  ("1.1.1.1", 1), now=1)
+    for t in (3, 5, 7, 9):          # b never acks -> evicted after retries
+        router.sweep_deliveries(now=t)
+    assert "b" not in reg.online()
+    sink.sent.clear()
+    router.handle({"t": "pi", "f": "b"}, ("2.2.2.2", 2), now=10)   # ping re-registers b
+    assert "b" in reg.online()
+    assert any(p.get("t") == "ack" for a, p in sink.sent)          # got a fresh ack

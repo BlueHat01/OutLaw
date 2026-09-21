@@ -282,3 +282,43 @@ def test_send_image_stall_retransmits_unacked_chunks(tmp_path):
         s._img_tx[mid]["at"] = 0
         s._sweep(proto.now_ts())
     assert mid not in s._img_tx
+
+
+# --- Task 15: end-to-end image transfer over a real loopback server ---
+
+@pytest.mark.asyncio
+async def test_image_end_to_end_over_loopback(tmp_path):
+    from PIL import Image
+    src = tmp_path / "s.png"; Image.new("RGB", (1000, 800), (200, 50, 50)).save(src)
+    loop = asyncio.get_running_loop()
+    reg = Registry(); q = QueueStore(tmp_path / "q.json"); holder = {}
+    def send(addr, pkt):
+        try: holder["t"].sendto(proto.encode(pkt), addr)
+        except proto.PacketTooLarge: pass
+    router = Router(reg, q, send)
+    st, _ = await loop.create_datagram_endpoint(
+        lambda: ServerProtocol(router, tmp_path / "d.log"), local_addr=("127.0.0.1", 0))
+    holder["t"] = st; saddr = st.get_extra_info("sockname")
+
+    # drive server delivery sweep periodically
+    async def pump():
+        while True:
+            await asyncio.sleep(0.3); router.sweep_deliveries(proto.now_ts())
+    pumper = asyncio.create_task(pump())
+
+    from outlaw.client_net import ClientSession
+    got = []
+    a = ClientSession("alice", saddr, on_message=lambda *x: None, on_roster=lambda u: None, on_link=lambda up: None)
+    b = ClientSession("bob", saddr, on_message=lambda *x: None, on_roster=lambda u: None,
+                      on_link=lambda up: None, on_image=lambda f, to, path, meta: got.append(path),
+                      media_dir=tmp_path / "bmedia")
+    await a.start(); await b.start(); await asyncio.sleep(0.3)
+    a.send_image("bob", str(src))
+    # let the windowed transfer + acks complete
+    for _ in range(60):
+        await asyncio.sleep(0.2)
+        if got: break
+    assert got, "bob should receive the image"
+    from pathlib import Path
+    assert Path(got[0]).exists() and Path(got[0]).stat().st_size > 0
+    pumper.cancel(); a.close(); b.close(); st.close()

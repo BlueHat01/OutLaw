@@ -128,3 +128,62 @@ def test_protocol_ignores_garbage(tmp_path):
     sp = ServerProtocol(router, debug_path=tmp_path / "debug.log")
     sp.datagram_received(b"\xff\xffnope", ("10.0.0.2", 5005))  # must not raise
     assert reg.online() == []
+
+
+# Task 8: server delivery confirmation table + ma handling + sweep
+def test_delivery_pending_recorded_and_cleared_by_ma(tmp_path):
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=0)
+    sink.sent.clear()
+    router.handle({"t": "m", "id": "x", "f": "a", "to": "b", "x": "hi", "s": 1, "n": 0, "c": 1}, ("1.1.1.1", 1), now=1)
+    assert ("b", "x", 0) in router.pending
+    # b acks receipt
+    router.handle({"t": "ma", "id": "x", "n": 0}, ("2.2.2.2", 2), now=1)
+    assert ("b", "x", 0) not in router.pending
+
+
+def test_sweep_retransmits_then_queues_and_evicts(tmp_path):
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=0)
+    router.handle({"t": "m", "id": "x", "f": "a", "to": "b", "x": "hi", "s": 1, "n": 0, "c": 1}, ("1.1.1.1", 1), now=1)
+    # b never acks; sweep at t=3,5,7 -> 3 retransmits, then queue+evict
+    for t in (3, 5, 7, 9):
+        router.sweep_deliveries(now=t)
+    assert ("b", "x", 0) not in router.pending
+    assert "b" not in reg.online()                  # evicted
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=10)  # reconnect
+    flushed = [pk for ad, pk in sink.sent if ad == ("2.2.2.2", 2) and pk.get("t") == "m"]
+    assert any(pk["id"] == "x" for pk in flushed)    # delivered on reconnect
+
+
+def test_multi_message_offline_all_delivered_regression(tmp_path):
+    # reproduces the reported bug: several msgs to a client that went away
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=0)  # b online then vanishes
+    for i, mid in enumerate(["m1", "m2", "m3"]):
+        router.handle({"t": "m", "id": mid, "f": "a", "to": "b", "x": str(i), "s": 1, "n": 0, "c": 1}, ("1.1.1.1", 1), now=1)
+    for t in (3, 5, 7, 9):
+        router.sweep_deliveries(now=t)               # b never acks -> all requeued
+    sink.sent.clear()
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=10)
+    got = [pk["id"] for ad, pk in sink.sent if ad == ("2.2.2.2", 2) and pk.get("t") == "m"]
+    assert set(got) == {"m1", "m2", "m3"}            # ALL three, not just the last
+
+
+# Task 9: server offline image grouping
+def test_offline_image_grouped_and_flushed(tmp_path):
+    router, reg, q, sink = make_router(tmp_path)
+    router.handle({"t": "reg", "f": "a"}, ("1.1.1.1", 1), now=0)
+    # b is offline; a sends a 2-chunk image to b
+    router.handle({"t": "ih", "id": "img1", "f": "a", "to": "b", "c": 2, "nm": "p.jpg", "mt": "image/jpeg", "sz": 6, "s": 1}, ("1.1.1.1", 1), now=1)
+    router.handle({"t": "im", "id": "img1", "n": 0, "c": 2, "d": "AAA"}, ("1.1.1.1", 1), now=1)
+    router.handle({"t": "im", "id": "img1", "n": 1, "c": 2, "d": "BBB"}, ("1.1.1.1", 1), now=1)
+    # nothing delivered yet (b offline), but it's queued as one image transfer
+    # (not drained here — draining would consume it before the reconnect flush below)
+    sink.sent.clear()
+    router.handle({"t": "reg", "f": "b"}, ("2.2.2.2", 2), now=2)
+    kinds = [pk["t"] for ad, pk in sink.sent if ad == ("2.2.2.2", 2) and pk.get("t") in ("ih", "im")]
+    assert kinds.count("ih") == 1 and kinds.count("im") == 2

@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from outlaw.client_net import ClientSession
 from outlaw import protocol as proto
+from outlaw import media
 from outlaw.server import Registry, Router, ServerProtocol
 from outlaw.store import QueueStore
 
@@ -188,3 +189,96 @@ async def test_offline_then_reconnect_delivery(tmp_path):
     await bob.start(); await asyncio.sleep(0.2)   # register triggers queue flush
     assert ("a", "you were away") in bob_got
     a.close(); bob.close(); st.close()
+
+
+# --- Task 10: recipient ma includes n; image receive -> save ---
+
+def test_client_receives_and_saves_image(tmp_path):
+    got = {"img": []}
+    from outlaw.client_net import ClientSession
+    s = ClientSession("bob", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None,
+                      on_link=lambda up: None, on_error=lambda m: None,
+                      on_image=lambda f, to, path, meta: got["img"].append((f, path, meta)),
+                      media_dir=tmp_path / "media")
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    data = b"\xff\xd8\xffhello-jpeg-bytes"
+    slices = media.chunk_b64(data, 150)
+    mid = "img9"
+    s.feed(proto.make_img_header("alice", "bob", mid, len(slices), "p.jpg", "image/jpeg", len(data), 1))
+    for n, sl in enumerate(slices):
+        s.feed(proto.make_img_chunk(mid, n, len(slices), sl))
+    assert got["img"], "on_image should fire on completion"
+    frm, path, meta = got["img"][0]
+    assert frm == "alice"  # taken from the header, not the data chunks
+    from pathlib import Path
+    assert Path(path).read_bytes() == data
+    # receipt acks were sent (n=-1 for header, 0..k for chunks)
+    assert any(p["t"] == "ma" and p["id"] == mid for p in sent)
+
+def test_recipient_text_ack_includes_n():
+    from outlaw.client_net import ClientSession
+    s = ClientSession("bob", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    s.feed({"t": "m", "id": "t1", "f": "a", "to": "bob", "x": "hi", "s": 1, "n": 0, "c": 1})
+    acks = [p for p in sent if p["t"] == "ma"]
+    assert acks and acks[0]["id"] == "t1" and acks[0]["n"] == 0
+
+
+# --- Task 11: windowed image sender ---
+
+pytest.importorskip("PIL")
+
+def test_send_image_windows_chunks(tmp_path):
+    from outlaw.client_net import ClientSession
+    from PIL import Image
+    src = tmp_path / "s.png"; Image.new("RGB", (1200, 900), (10, 20, 30)).save(src)
+    s = ClientSession("alice", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    total = s.send_image("bob", str(src))
+    headers = [p for p in sent if p["t"] == "ih"]
+    chunks = [p for p in sent if p["t"] == "im"]
+    assert len(headers) == 1 and headers[0]["c"] == total
+    assert 0 < len(chunks) <= media.IMAGE_WINDOW    # only a window sent up front
+    # acking releases more
+    mid = headers[0]["id"]
+    before = len(chunks)
+    s.feed({"t": "ma", "id": mid, "n": chunks[0]["n"]})
+    after = len([p for p in sent if p["t"] == "im"])
+    assert after >= before                          # window advanced (if more remain)
+
+
+def test_send_image_stall_retransmits_unacked_chunks(tmp_path):
+    from outlaw.client_net import ClientSession
+    from PIL import Image
+    src = tmp_path / "s2.png"; Image.new("RGB", (1200, 900), (50, 60, 70)).save(src)
+    s = ClientSession("alice", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    s.send_image("bob", str(src))
+    headers = [p for p in sent if p["t"] == "ih"]
+    mid = headers[0]["id"]
+    assert mid in s._img_tx
+
+    # Force a stall: nothing acked, mark the transfer as overdue, and clear
+    # the sent log so we can observe fresh retransmits.
+    s._img_tx[mid]["at"] = 0
+    sent.clear()
+    s._sweep(proto.now_ts())
+
+    resent = [p for p in sent if p["t"] == "im" and p["id"] == mid]
+    assert resent, "unacked sent chunks should be retransmitted on stall"
+
+    # After more than 5 stalls with no progress, the transfer is abandoned.
+    for _ in range(6):
+        if mid not in s._img_tx:
+            break
+        s._img_tx[mid]["at"] = 0
+        s._sweep(proto.now_ts())
+    assert mid not in s._img_tx

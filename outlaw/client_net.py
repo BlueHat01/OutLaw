@@ -1,21 +1,28 @@
 # outlaw/client_net.py
 import asyncio
+from pathlib import Path
 from outlaw import protocol as proto
+from outlaw import media
 
 class ClientSession:
     LINK_TIMEOUT = 90            # seconds without inbound => link considered down
 
-    def __init__(self, nick, server_addr, on_message, on_roster, on_link, on_error=None):
+    def __init__(self, nick, server_addr, on_message, on_roster, on_link, on_error=None,
+                 on_image=None, media_dir=None):
         self.nick = nick
         self.server_addr = server_addr
         self.on_message = on_message
         self.on_roster = on_roster
         self.on_link = on_link
         self.on_error = on_error
+        self.on_image = on_image
+        self.media_dir = media_dir or Path.home() / ".outlaw" / "media"
         self.transport = None
         self._pending = {}       # mid -> {"packets": {n: pkt}, "tries": int, "at": ts, "acked": set(n)}
         self._dupes = proto.DuplicateFilter()
         self._reasm = proto.ChunkReassembler()
+        self._img = proto.ImageAssembler()
+        self._img_tx = {}        # mid -> {"to","header","chunks":{n:pkt},"acked":set(),"sent":set(),"at":ts}
         self._link_up = False
         self._closing = False
         self._last_rx = proto.now_ts()
@@ -42,23 +49,48 @@ class ClientSession:
                 self.on_link(True)
         elif t == "ma":
             mid = packet.get("id")
+            # text message pending (existing behaviour)
             e = self._pending.get(mid)
             if e is not None:
                 e["acked"].add(packet.get("n"))
                 if len(e["acked"]) >= len(e["packets"]):
                     del self._pending[mid]
+            # image transfer pending
+            tx = self._img_tx.get(mid)
+            if tx is not None:
+                n = packet.get("n")
+                if n is not None and n >= 0:
+                    tx["acked"].add(n)
+                tx["at"] = proto.now_ts()
+                if len(tx["acked"]) >= len(tx["chunks"]):
+                    del self._img_tx[mid]
+                else:
+                    self._img_advance(mid)
         elif t == "err":
             if self.on_error is not None:
                 self.on_error(packet.get("m", ""))
         elif t == "m":
             mid = packet.get("id")
-            self._raw_send({"t": "ma", "id": mid})
+            self._raw_send({"t": "ma", "id": mid, "n": packet.get("n")})
             if self._dupes.seen(mid + ":" + str(packet.get("n"))):
                 return
             full = self._reasm.add(mid, packet.get("n", 0), packet.get("c", 1),
                                    packet.get("x", ""), proto.now_ts())
             if full is not None:
                 self.on_message(packet.get("f"), packet.get("to"), full, packet.get("s"))
+        elif t == "ih":
+            self._raw_send({"t": "ma", "id": packet.get("id"), "n": -1})
+            self._img.add_header(packet.get("id"), packet.get("f"), packet.get("nm"),
+                                 packet.get("mt"), packet.get("sz"), proto.now_ts())
+        elif t == "im":
+            mid = packet.get("id")
+            self._raw_send({"t": "ma", "id": mid, "n": packet.get("n")})
+            done = self._img.add_chunk(mid, packet.get("n"), packet.get("c"),
+                                       packet.get("d", ""), proto.now_ts())
+            if done is not None and self.on_image is not None:
+                data = media.join_b64(done["slices"])
+                path = media.save_image(self.media_dir, done["frm"], mid, done["mime"], data)
+                self.on_image(done["frm"], None, path, done)
 
     # --- outbound ---
     def send_text(self, to, text):
@@ -93,8 +125,36 @@ class ClientSession:
             await asyncio.sleep(30)
             self._raw_send({"t": "pi", "f": self.nick})
 
+    def send_image(self, to, path):
+        data, mime = media.compress_image(path)           # raises ImageError
+        import os
+        slices = media.chunk_b64(data, 150)
+        mid = proto.new_id()
+        name = media.safe_name(os.path.basename(path))
+        header = proto.make_img_header(self.nick, to, mid, len(slices), name, mime, len(data), proto.now_ts())
+        chunks = {n: proto.make_img_chunk(mid, n, len(slices), sl) for n, sl in enumerate(slices)}
+        self._img_tx[mid] = {"to": to, "header": header, "chunks": chunks,
+                             "acked": set(), "sent": set(), "at": proto.now_ts()}
+        self._raw_send(header)
+        self._img_advance(mid)
+        return len(slices)
+
+    def _img_advance(self, mid):
+        tx = self._img_tx.get(mid)
+        if tx is None:
+            return
+        inflight = len(tx["sent"]) - len(tx["acked"])
+        for n in sorted(tx["chunks"]):
+            if inflight >= media.IMAGE_WINDOW:
+                break
+            if n not in tx["sent"]:
+                self._raw_send(tx["chunks"][n])
+                tx["sent"].add(n)
+                inflight += 1
+
     def _sweep(self, now):
         self._reasm.purge(now)
+        self._img.purge(now)
         for mid, e in list(self._pending.items()):
             if now - e["at"] >= 2:
                 if e["tries"] >= 3:
@@ -105,6 +165,16 @@ class ClientSession:
                     for n, pkt in e["packets"].items():
                         if n not in e["acked"]:
                             self._raw_send(pkt)
+        for mid, tx in list(self._img_tx.items()):
+            if now - tx["at"] >= 2:
+                tx["tries"] = tx.get("tries", 0) + 1
+                if tx["tries"] > 5:
+                    del self._img_tx[mid]
+                else:
+                    tx["at"] = now
+                    for n in sorted(tx["sent"]):
+                        if n not in tx["acked"]:
+                            self._raw_send(tx["chunks"][n])
 
     async def _retransmit_loop(self):
         while not self._closing:

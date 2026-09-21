@@ -73,7 +73,7 @@ class OutlawApp(App):
     def _status_text(self):
         mode = "group" if self.mode[0] == "group" else f"dm:{self.mode[1]}"
         link = "[#00ff41]● LINK UP[/]" if self.link_up else "[#ff3333]● LINK DOWN[/]"
-        return f"[{mode}] {link}  tx:{self.tx} rx:{self.rx}  /who /dm /group /help /quit"
+        return f"[{mode}] {link}  tx:{self.tx} rx:{self.rx}  /who /dm /group /img /open /history /help /quit"
 
     def _refresh_status(self):
         self.query_one("#status", Static).update(self._status_text())
@@ -114,7 +114,8 @@ class OutlawApp(App):
         elif kind == "clear":
             log.clear()
         elif kind == "help":
-            log.write("[#ffb000]/dm <nick> · /group · /msg <nick> <text> · /nick <name> · /who · /clear · /quit[/]")
+            log.write("[#ffb000]/dm <nick> · /group · /msg <nick> <text> · /nick <name> · "
+                      "/img <path> · /open [id] · /history [n] · /who · /clear · /quit[/]")
         elif kind == "quit":
             self.session.leave()
             self.exit()

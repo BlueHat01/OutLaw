@@ -100,8 +100,8 @@ class CliChat:
         elif k == "clear":
             self.out("\033[2J\033[H")
         elif k == "help":
-            self.out(f"{A}/dm <nick>  /group  /msg <nick> <text>  "
-                     f"/nick <name>  /who  /clear  /quit{X}")
+            self.out(f"{A}/dm <nick>  /group  /msg <nick> <text>  /nick <name>  "
+                     f"/img <path>  /open [id]  /history [n]  /who  /clear  /quit{X}")
         elif k == "quit":
             self.session.leave()
             self._running = False

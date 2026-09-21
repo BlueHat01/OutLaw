@@ -101,3 +101,54 @@ def test_unknown_command_prints_error():
     chat, fake, out = make_chat()
     chat.dispatch("/bogus")
     assert any("!" in line for line in out)
+
+
+class FakeSessionImg(FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.images = []
+    def send_image(self, to, path):
+        self.images.append((to, path)); return 3
+
+
+def make_chat_img(tmp_path):
+    out = []
+    fake = FakeSessionImg()
+    from client_cli import CliChat
+    chat = CliChat("rahul", lambda c: fake, out=out.append,
+                   history_path=tmp_path / "history.log")
+    return chat, fake, out
+
+
+def test_img_command_sends(tmp_path):
+    chat, fake, out = make_chat_img(tmp_path)
+    chat.dispatch("/img /sdcard/p.jpg")
+    assert fake.images == [("__all__", "/sdcard/p.jpg")]
+
+
+def test_img_error_is_reported(tmp_path):
+    chat, fake, out = make_chat_img(tmp_path)
+    def boom(to, path):
+        from outlaw.media import ImageError
+        raise ImageError("Pillow not installed")
+    fake.send_image = boom
+    chat.dispatch("/img /x.jpg")
+    assert any("Pillow" in line for line in out)
+
+
+def test_on_image_prints_and_records(tmp_path):
+    chat, fake, out = make_chat_img(tmp_path)
+    chat.on_image("alice", "__all__", "/data/media/alice-1.jpg", {"name": "p.jpg"})
+    assert any("alice" in line and "image" in line.lower() for line in out)
+    from outlaw import store
+    rows = store.load_recent_history(tmp_path / "history.jsonl")
+    assert any(r.get("kind") == "image" for r in rows)
+
+
+def test_history_command_prints_recent(tmp_path):
+    from outlaw import store
+    store.append_history(tmp_path / "history.jsonl", {"ts": 1, "frm": "a", "to": "__all__", "kind": "text", "text": "old line"})
+    chat, fake, out = make_chat_img(tmp_path)
+    out.clear()
+    chat.dispatch("/history 5")
+    assert any("old line" in line for line in out)

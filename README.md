@@ -76,8 +76,34 @@ It needs no extra dependencies beyond the Python standard library.
 | `/msg <nick> <text>` | Send a one-off direct message |
 | `/nick <name>` | Change your alias |
 | `/clear` | Clear the message stream |
+| `/img <path>` | Send an image (compressed, chunked over the tunnel) |
+| `/open [id\|last]` | Open a received image (defaults to the last one) |
+| `/history [n]` | Show the last `n` history entries (default 20) |
 | `/help` | Show command help |
 | `/quit` | Leave and exit |
+
+## Images
+
+Outlaw can send images over the same reliable UDP tunnel used for chat. Since
+the tunnel is bandwidth-constrained, images are auto-compressed with Pillow
+to **≤24 KB** before sending — expect a noticeable delay for the transfer to
+complete, especially on a slow tunnel; progress is shown while it sends.
+
+- **Sending:** `/img <path>` compresses the image and streams it as a series
+  of small chunks (a sliding window of chunks in flight, each acked and
+  retransmitted like text messages). Sending requires Pillow:
+  ```bash
+  pip install Pillow
+  ```
+  (already included if you installed via `pip install -r requirements.txt`).
+- **Receiving:** incoming images are reassembled automatically and saved to
+  `~/.outlaw/media/`; a line in the chat stream shows where the file landed.
+- **Viewing:** `/open` opens the most recently received image, or
+  `/open <id>` for a specific one, via `termux-open` (Termux) or `xdg-open`
+  (Linux desktop).
+- Both `client.py` (Textual TUI) and `client_cli.py` (line-mode) support
+  sending, receiving, and opening images identically — they share the same
+  `ClientSession` network core.
 
 ## Manual Test Checklist
 

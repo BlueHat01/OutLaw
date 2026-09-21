@@ -31,6 +31,8 @@ async def main():
         on_roster=app.set_roster,
         on_link=app.set_link,
         on_error=app.show_system,
+        on_image=app.on_image,
+        media_dir=DATA_DIR / "media",
     )
     app.session = session
     try:

@@ -10,6 +10,8 @@ from pathlib import Path
 from outlaw.store import Config, append_line
 from outlaw.client_net import ClientSession
 from outlaw.commands import parse_input
+from outlaw import media, store as _store
+from outlaw.media import ImageError
 
 DATA_DIR = Path(os.path.expanduser("~/.outlaw"))
 SERVER = (os.environ.get("OUTLAW_SERVER", "10.0.0.1"),
@@ -36,7 +38,11 @@ class CliChat:
         self.roster = []
         self.out = out
         self.history_path = history_path
+        self.jsonl_path = Path(self.history_path).with_suffix(".jsonl") if self.history_path else None
+        self.last_image = None
         self._running = True
+        if self.jsonl_path:
+            self._preload = _store.load_recent_history(self.jsonl_path)
         self.session = session_factory(self)
 
     # --- ClientSession callbacks (called on the asyncio loop) ---
@@ -44,6 +50,15 @@ class CliChat:
         tag = "" if to == "__all__" else " »you"
         self.out(f"{G}{_stamp()} {frm}{tag}{X}  {text}")
         self._log(f"{_stamp()} {frm}{tag}: {text}")
+        self._log_entry({"ts": int(ts) if ts else int(time.time()), "frm": frm, "to": to,
+                          "kind": "text", "text": text})
+
+    def on_image(self, frm, to, path, meta):
+        tag = "" if to == "__all__" else " »you"
+        self.out(f"{G}{_stamp()} {frm}{tag}  [image saved: {path}] (/open){X}")
+        self.last_image = path
+        self._log_entry({"ts": int(time.time()), "frm": frm, "to": to,
+                          "kind": "image", "path": path, "name": (meta or {}).get("name")})
 
     def on_roster(self, users):
         self.roster = users
@@ -92,15 +107,44 @@ class CliChat:
             self._running = False
         elif k == "error":
             self.out(f"{RED}! {act['msg']}{X}")
+        elif k == "img":
+            try:
+                to = "__all__" if self.mode[0] == "group" else self.mode[1]
+                self.session.send_image(to, act["path"])
+                self.out(f"{A}* sending image → {act['path']}{X}")
+            except ImageError as e:
+                self.out(f"{RED}! {e}{X}")
+        elif k == "open":
+            if act["arg"] == "last":
+                target = self.last_image
+            else:
+                target = media.find_image(DATA_DIR / "media", act["arg"])
+            if target and media.open_image(target):
+                self.out(f"{D}* opening {target}{X}")
+            else:
+                self.out(f"{RED}! nothing to open{X}")
+        elif k == "history":
+            rows = _store.load_recent_history(self.jsonl_path, act["n"]) if self.jsonl_path else []
+            for r in rows:
+                if r.get("kind") == "image":
+                    self.out(f"{D}{r.get('frm')}: [image {r.get('name')}]{X}")
+                else:
+                    self.out(f"{D}{r.get('frm')}: {r.get('text', '')}{X}")
 
     def _echo(self, to, text):
         tgt = "" if to == "__all__" else f" »{to}"
         self.out(f"{A}{_stamp()} {self.nick}{tgt}{X}  {text}")
         self._log(f"{_stamp()} {self.nick}{tgt}: {text}")
+        self._log_entry({"ts": int(time.time()), "frm": self.nick, "to": to,
+                          "kind": "text", "text": text})
 
     def _log(self, line):
         if self.history_path:
             append_line(self.history_path, line)
+
+    def _log_entry(self, entry):
+        if self.jsonl_path:
+            _store.append_history(self.jsonl_path, entry)
 
 
 def resolve_nick():
@@ -123,6 +167,8 @@ async def main():
             on_roster=chat.on_roster,
             on_link=chat.on_link,
             on_error=chat.on_error,
+            on_image=chat.on_image,
+            media_dir=DATA_DIR / "media",
         )
 
     chat = CliChat(nick, factory, out=print, history_path=DATA_DIR / "history.log")

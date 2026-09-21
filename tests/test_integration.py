@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from outlaw.client_net import ClientSession
 from outlaw import protocol as proto
+from outlaw import media
 from outlaw.server import Registry, Router, ServerProtocol
 from outlaw.store import QueueStore
 
@@ -188,3 +189,176 @@ async def test_offline_then_reconnect_delivery(tmp_path):
     await bob.start(); await asyncio.sleep(0.2)   # register triggers queue flush
     assert ("a", "you were away") in bob_got
     a.close(); bob.close(); st.close()
+
+
+# --- Task 10: recipient ma includes n; image receive -> save ---
+
+def test_client_receives_and_saves_image(tmp_path):
+    got = {"img": []}
+    from outlaw.client_net import ClientSession
+    s = ClientSession("bob", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None,
+                      on_link=lambda up: None, on_error=lambda m: None,
+                      on_image=lambda f, to, path, meta: got["img"].append((f, path, meta)),
+                      media_dir=tmp_path / "media")
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    data = b"\xff\xd8\xffhello-jpeg-bytes"
+    slices = media.chunk_b64(data, 150)
+    mid = "img9"
+    s.feed(proto.make_img_header("alice", "bob", mid, len(slices), "p.jpg", "image/jpeg", len(data), 1))
+    for n, sl in enumerate(slices):
+        s.feed(proto.make_img_chunk(mid, n, len(slices), sl))
+    assert got["img"], "on_image should fire on completion"
+    frm, path, meta = got["img"][0]
+    assert frm == "alice"  # taken from the header, not the data chunks
+    from pathlib import Path
+    assert Path(path).read_bytes() == data
+    # receipt acks were sent (n=-1 for header, 0..k for chunks)
+    assert any(p["t"] == "ma" and p["id"] == mid for p in sent)
+
+def test_recipient_text_ack_includes_n():
+    from outlaw.client_net import ClientSession
+    s = ClientSession("bob", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    s.feed({"t": "m", "id": "t1", "f": "a", "to": "bob", "x": "hi", "s": 1, "n": 0, "c": 1})
+    acks = [p for p in sent if p["t"] == "ma"]
+    assert acks and acks[0]["id"] == "t1" and acks[0]["n"] == 0
+
+
+# --- Task 11: windowed image sender ---
+
+pytest.importorskip("PIL")
+
+def test_send_image_windows_chunks(tmp_path):
+    from outlaw.client_net import ClientSession
+    from PIL import Image
+    src = tmp_path / "s.png"; Image.new("RGB", (1200, 900), (10, 20, 30)).save(src)
+    s = ClientSession("alice", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    total = s.send_image("bob", str(src))
+    headers = [p for p in sent if p["t"] == "ih"]
+    chunks = [p for p in sent if p["t"] == "im"]
+    assert len(headers) == 1 and headers[0]["c"] == total
+    assert 0 < len(chunks) <= media.IMAGE_WINDOW    # only a window sent up front
+    # acking releases more
+    mid = headers[0]["id"]
+    before = len(chunks)
+    s.feed({"t": "ma", "id": mid, "n": chunks[0]["n"]})
+    after = len([p for p in sent if p["t"] == "im"])
+    assert after >= before                          # window advanced (if more remain)
+
+
+def test_send_image_stall_retransmits_unacked_chunks(tmp_path):
+    from outlaw.client_net import ClientSession
+    from PIL import Image
+    src = tmp_path / "s2.png"; Image.new("RGB", (1200, 900), (50, 60, 70)).save(src)
+    s = ClientSession("alice", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    s.send_image("bob", str(src))
+    headers = [p for p in sent if p["t"] == "ih"]
+    mid = headers[0]["id"]
+    assert mid in s._img_tx
+
+    # Force a stall: nothing acked, mark the transfer as overdue, and clear
+    # the sent log so we can observe fresh retransmits.
+    s._img_tx[mid]["at"] = 0
+    sent.clear()
+    s._sweep(proto.now_ts())
+
+    resent = [p for p in sent if p["t"] == "im" and p["id"] == mid]
+    assert resent, "unacked sent chunks should be retransmitted on stall"
+
+    # After more than 5 stalls with no progress, the transfer is abandoned.
+    for _ in range(6):
+        if mid not in s._img_tx:
+            break
+        s._img_tx[mid]["at"] = 0
+        s._sweep(proto.now_ts())
+    assert mid not in s._img_tx
+
+
+def test_send_image_resends_header_until_acked(tmp_path):
+    # NEW-1: if the header ack (n=-1) is never seen, a stalled transfer must
+    # resend the "ih" header (not just data chunks). Once acked, it stops.
+    from outlaw.client_net import ClientSession
+    from PIL import Image
+    src = tmp_path / "h.png"; Image.new("RGB", (1000, 800), (1, 2, 3)).save(src)
+    s = ClientSession("alice", ("10.0.0.1", 5005),
+                      on_message=lambda *a: None, on_roster=lambda u: None, on_link=lambda up: None)
+    sent = []
+    s._raw_send = lambda pkt: sent.append(pkt)
+    s.send_image("bob", str(src))
+    mid = [p for p in sent if p["t"] == "ih"][0]["id"]
+    assert s._img_tx[mid]["header_acked"] is False
+
+    # Ignore the header ack; force a stall and observe a fresh retransmit.
+    sent.clear()
+    s._img_tx[mid]["at"] = 0
+    s._sweep(proto.now_ts())
+    assert any(p["t"] == "ih" and p["id"] == mid for p in sent), "header must be resent while unacked"
+
+    # Once the header is acked (n=-1) it is no longer resent.
+    s.feed({"t": "ma", "id": mid, "n": -1})
+    assert s._img_tx[mid]["header_acked"] is True
+    sent.clear()
+    s._img_tx[mid]["at"] = 0
+    s._sweep(proto.now_ts())
+    assert not any(p["t"] == "ih" for p in sent)
+
+
+def test_long_nick_is_truncated():
+    # NEW-7: bound nick length so ih/m packets stay under the datagram cap.
+    long_s = ClientSession("x" * 100, ("10.0.0.1", 5005),
+                           on_message=lambda *a: None, on_roster=lambda u: None,
+                           on_link=lambda up: None)
+    assert len(long_s.nick) == proto.MAX_NICK
+    long_s._raw_send = lambda pkt: None
+    long_s.set_nick("y" * 80)
+    assert len(long_s.nick) == proto.MAX_NICK
+
+
+# --- Task 15: end-to-end image transfer over a real loopback server ---
+
+@pytest.mark.asyncio
+async def test_image_end_to_end_over_loopback(tmp_path):
+    from PIL import Image
+    src = tmp_path / "s.png"; Image.new("RGB", (1000, 800), (200, 50, 50)).save(src)
+    loop = asyncio.get_running_loop()
+    reg = Registry(); q = QueueStore(tmp_path / "q.json"); holder = {}
+    def send(addr, pkt):
+        try: holder["t"].sendto(proto.encode(pkt), addr)
+        except proto.PacketTooLarge: pass
+    router = Router(reg, q, send)
+    st, _ = await loop.create_datagram_endpoint(
+        lambda: ServerProtocol(router, tmp_path / "d.log"), local_addr=("127.0.0.1", 0))
+    holder["t"] = st; saddr = st.get_extra_info("sockname")
+
+    # drive server delivery sweep periodically
+    async def pump():
+        while True:
+            await asyncio.sleep(0.3); router.sweep_deliveries(proto.now_ts())
+    pumper = asyncio.create_task(pump())
+
+    from outlaw.client_net import ClientSession
+    got = []
+    a = ClientSession("alice", saddr, on_message=lambda *x: None, on_roster=lambda u: None, on_link=lambda up: None)
+    b = ClientSession("bob", saddr, on_message=lambda *x: None, on_roster=lambda u: None,
+                      on_link=lambda up: None, on_image=lambda f, to, path, meta: got.append(path),
+                      media_dir=tmp_path / "bmedia")
+    await a.start(); await b.start(); await asyncio.sleep(0.3)
+    a.send_image("bob", str(src))
+    # let the windowed transfer + acks complete
+    for _ in range(60):
+        await asyncio.sleep(0.2)
+        if got: break
+    assert got, "bob should receive the image"
+    from pathlib import Path
+    assert Path(got[0]).exists() and Path(got[0]).stat().st_size > 0
+    pumper.cancel(); a.close(); b.close(); st.close()

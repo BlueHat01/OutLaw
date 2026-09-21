@@ -4,6 +4,9 @@ from pathlib import Path
 from outlaw import protocol as proto
 from outlaw.store import QueueStore, append_line
 
+DELIVERY_RETRIES = 3
+DELIVERY_INTERVAL = 2
+
 
 class Registry:
     def __init__(self):
@@ -48,18 +51,81 @@ class Router:
         self.reg = registry
         self.q = queue
         self.send = send
+        self.pending = {}
+        self._img_build = {}
+        self._img_route = {}  # transfer id -> {"f": sender, "to": recipient}; "im" chunks carry no f/to
 
     def _broadcast_online(self):
         pkt = {"t": "ack", "on": self.reg.online()}
         for nick in self.reg.online():
             self.send(self.reg.addr_of(nick), pkt)
 
-    def _deliver_or_queue(self, nick, packet):
+    def _queue_image_part(self, nick, packet, now):
+        key = (nick, packet.get("id"))
+        b = self._img_build.get(key)
+        if b is None:
+            b = {"header": None, "chunks": {}, "c": None, "bytes": 0, "at": now}
+            self._img_build[key] = b
+        b["at"] = now
+        if packet.get("t") == "ih":
+            b["header"] = packet
+            b["c"] = packet.get("c")
+            b["bytes"] = packet.get("sz", 0)
+        else:  # im
+            b["chunks"][packet.get("n")] = packet
+            if b["c"] is None:
+                b["c"] = packet.get("c")
+        if b["c"] is not None and len(b["chunks"]) == b["c"]:
+            transfer = {
+                "id": packet.get("id"),
+                "header": b["header"] or {"t": "ih", "id": packet.get("id"),
+                                          "f": "?", "to": nick, "c": b["c"],
+                                          "nm": "image", "mt": "image/jpeg", "sz": b["bytes"], "s": 0},
+                "chunks": [b["chunks"][i] for i in range(b["c"])],
+                "bytes": b["bytes"],
+            }
+            self.q.enqueue_image(nick, transfer)
+            del self._img_build[key]
+            self._img_route.pop(packet.get("id"), None)
+
+    def purge_image_builds(self, now):
+        for key in list(self._img_build.keys()):
+            b = self._img_build[key]
+            if now - b.get("at", now) > proto.IMAGE_TRANSFER_TIMEOUT:
+                del self._img_build[key]
+                self._img_route.pop(key[1], None)
+
+    def _deliver_or_queue(self, nick, packet, now):
         addr = self.reg.addr_of(nick)
         if addr:
             self.send(addr, packet)
+            if packet.get("t") in ("m", "im"):
+                key = (nick, packet.get("id"), packet.get("n"))
+                self.pending[key] = {"packet": packet, "tries": 0, "at": now, "nick": nick}
+        elif packet.get("t") in ("ih", "im"):
+            self._queue_image_part(nick, packet, now)
         else:
             self.q.enqueue(nick, packet)
+
+    def sweep_deliveries(self, now):
+        for key in list(self.pending.keys()):
+            e = self.pending[key]
+            if now - e["at"] < DELIVERY_INTERVAL:
+                continue
+            addr = self.reg.addr_of(e["nick"])
+            if e["tries"] >= DELIVERY_RETRIES or addr is None:
+                pkt = e["packet"]
+                if pkt.get("t") in ("ih", "im"):
+                    self._queue_image_part(e["nick"], pkt, now)
+                else:
+                    self.q.enqueue(e["nick"], pkt)
+                self.reg.remove(e["nick"])
+                del self.pending[key]
+            else:
+                e["tries"] += 1
+                e["at"] = now
+                if addr:
+                    self.send(addr, e["packet"])
 
     def handle(self, packet, addr, now):
         t = packet.get("t")
@@ -77,23 +143,79 @@ class Router:
             self._broadcast_online()
             for m in self.q.drain(nick):
                 self.send(addr, m)
+            for transfer in self.q.drain_images(nick):
+                self.send(addr, transfer["header"])
+                for ch in transfer["chunks"]:
+                    self.send(addr, ch)
         elif t == "pi":
-            self.reg.touch(packet.get("f"), now)
+            nick = packet.get("f")
+            if nick and self.reg.addr_of(nick) is None:
+                # Evicted (or never-registered) but still-live client: a ping
+                # re-registers it just like a fresh reg, then flushes its queues.
+                self.reg.register(nick, addr, now)
+                self.send(addr, {"t": "ack", "on": self.reg.online()})
+                self._broadcast_online()
+                for m in self.q.drain(nick):
+                    self.send(addr, m)
+                for transfer in self.q.drain_images(nick):
+                    self.send(addr, transfer["header"])
+                    for ch in transfer["chunks"]:
+                        self.send(addr, ch)
+            else:
+                self.reg.touch(nick, now)
             self.send(addr, {"t": "po"})
         elif t == "lv":
             self.reg.remove(packet.get("f"))
             self._broadcast_online()
-        elif t == "m":
-            self.reg.touch(packet.get("f"), now)
-            self.send(addr, {"t": "ma", "id": packet.get("id"), "n": packet.get("n")})
+        elif t == "ih":
+            frm = packet.get("f")
             to = packet.get("to")
+            self._img_route[packet.get("id")] = {"f": frm, "to": to}
+            self.reg.touch(frm, now)
+            self.send(addr, {"t": "ma", "id": packet.get("id"), "n": -1})  # header ack (n=-1)
             if to == proto.BROADCAST:
                 for nick in self.reg.online():
-                    if nick != packet.get("f"):
-                        self._deliver_or_queue(nick, packet)
+                    if nick != frm:
+                        self._deliver_or_queue(nick, packet, now)
             elif to:
-                self._deliver_or_queue(to, packet)
-        # t == "ma": recipient ack; consumed by reliable layer, ignore here
+                self._deliver_or_queue(to, packet, now)
+        elif t == "m":
+            frm = packet.get("f")
+            to = packet.get("to")
+            self.reg.touch(frm, now)
+            self.send(addr, {"t": "ma", "id": packet.get("id"), "n": packet.get("n")})
+            if to == proto.BROADCAST:
+                for nick in self.reg.online():
+                    if nick != frm:
+                        self._deliver_or_queue(nick, packet, now)
+            elif to:
+                self._deliver_or_queue(to, packet, now)
+        elif t == "im":
+            frm = packet.get("f")
+            to = packet.get("to")
+            if frm is None or to is None:
+                # "im" data chunks carry no f/to (kept small); recover routing
+                # from the transfer's "ih" header, seen earlier for this id.
+                route = self._img_route.get(packet.get("id"), {})
+                frm = frm if frm is not None else route.get("f")
+                to = to if to is not None else route.get("to")
+            if not to:
+                # No header seen yet for this transfer: we cannot route this
+                # chunk. Do NOT ack it — the sender retransmits until the "ih"
+                # header lands and populates the route.
+                return
+            self.reg.touch(frm, now)
+            self.send(addr, {"t": "ma", "id": packet.get("id"), "n": packet.get("n")})
+            if to == proto.BROADCAST:
+                for nick in self.reg.online():
+                    if nick != frm:
+                        self._deliver_or_queue(nick, packet, now)
+            else:
+                self._deliver_or_queue(to, packet, now)
+        elif t == "ma":
+            nick = self.reg.nick_of(addr)
+            if nick is not None:
+                self.pending.pop((nick, packet.get("id"), packet.get("n")), None)
 
 
 class ServerProtocol(asyncio.DatagramProtocol):
@@ -141,7 +263,9 @@ async def run_server(host="0.0.0.0", port=5005, data_dir="~/.outlaw"):
 
     async def housekeeping():
         while True:
-            await asyncio.sleep(15)
+            await asyncio.sleep(2)
+            router.sweep_deliveries(proto.now_ts())
+            router.purge_image_builds(proto.now_ts())
             for nick in registry.evict_stale(proto.now_ts(), timeout=90):
                 router._broadcast_online()
             queue.persist()

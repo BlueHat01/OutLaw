@@ -2,7 +2,7 @@
 
 > **Purpose of this file:** a living hand-off record so any AI coding agent (or human) can pick up where the last session left off. It describes what Outlaw is, how the code is organized, what has been built, what is deliberately deferred, and the real-world deployment gotchas discovered while running it. **Keep it updated** at the end of any work session (see "Maintaining this file" at the bottom).
 
-Last updated: 2026-09-21 · Branch: `master` · Tests: **101 passing**
+Last updated: 2026-09-21 · Branch: `master` · Tests: **108 passing**
 
 ---
 
@@ -56,9 +56,9 @@ Reliability: sender retransmits unacked chunks up to 3× (2s apart); recipient d
 
 - `config.json` — saved nick. `history.log` — legacy local received/sent lines. `history.jsonl` — structured persistent history (preloaded on launch, last 200 entries). `queue.json` — (server) offline text+image queue. `media/` — saved received images. `debug.log` — (server) malformed-datagram errors. **Message contents are NOT logged on the server** (relay is blind by design).
 
-## Test suite (101 passing)
+## Test suite (108 passing)
 
-`test_protocol` 19 · `test_media` 9 · `test_store` 10 · `test_history` 4 · `test_server` 15 · `test_commands` 13 · `test_integration` 16 (real-socket loopback: broadcast, DM, offline replay, per-chunk retransmit, end-to-end image transfer) · `test_cli` 15. UI (`ui.py`) has no automated test (needs a real terminal); it is smoke-imported.
+`test_protocol` 20 · `test_media` 11 · `test_store` 10 · `test_history` 4 · `test_server` 17 · `test_commands` 13 · `test_integration` 18 (real-socket loopback: broadcast, DM, offline replay, per-chunk retransmit, end-to-end image transfer, header retransmit) · `test_cli` 15. UI (`ui.py`) has no automated test (needs a real terminal); it is smoke-imported.
 
 ## Deployment (how to run)
 
@@ -73,10 +73,12 @@ Phone (Termux): `iodine -f -P <pw> tunnel.example.com`, then `OUTLAW_SERVER=<TUN
 4. **FIXED (2026-09-21): offline multi-message loss.** Previously, several messages sent to a client that had gone silent could collapse to only the last one being redelivered on reconnect. Root cause was the old "no server→recipient retransmit" gap combined with best-effort single-shot delivery. Now fixed via the server's delivery-pending table + `ma`-confirmed retransmit (3× at ~2s) + queue fallback + eviction (see Work log and Protocol section above) — regression-tested in `test_server.py::test_multi_message_offline_all_delivered_regression`.
 5. **No local outgoing queue while link is down.** Messages composed during a sustained outage can drop after the 3-try retransmit window. Deferred.
 6. Cosmetic deferrals: `show_message` uses local receive time (not packet `s`); queue persistence is non-atomic; `/nick` leaves the old nick in the registry until 90s eviction.
+7. **Deferred (minor):** `Router._img_route[id]` is purged with `_img_build` only for *offline/queued* image transfers; a transfer delivered directly to an *online* recipient leaves its small `{f,to}` route entry behind, so `_img_route` grows slowly on a very long-running relay. Fix would be to time-purge `_img_route` independently in `purge_image_builds`.
+8. **Deferred (minor):** `compress_image` runs synchronously on the asyncio loop (brief UI/ping stall while compressing a large source); per-chunk transfer progress (spec §1.3/1.4) is not wired to a live callback.
 
 ## Work log (most recent first)
 
-- **2026-09-21** — Implemented **image sending, reliable delivery fix, and persistent history** end-to-end (subagent-driven from `docs/superpowers/plans/2026-09-21-outlaw-images-history.md`), 101 tests passing:
+- **2026-09-21** — Implemented **image sending, reliable delivery fix, and persistent history** end-to-end (subagent-driven from `docs/superpowers/plans/2026-09-21-outlaw-images-history.md`), 108 tests passing:
   - **Images:** new `outlaw/media.py` compresses with Pillow to a guaranteed ≤24 KB JPEG (downscale+requality loop), base64-chunks it, and streams it through new `ih`/`im` packets over a sliding window (`IMAGE_WINDOW=6` chunks in flight, ack-driven advance, retransmit on stall). Receiver reassembles via `ImageAssembler`, decodes, and saves to `~/.outlaw/media/`; `/img <path>` sends, `/open [id|last]` views (termux-open/xdg-open). Offline recipients get images grouped whole and queued (capped 3/768KB per user) for replay on reconnect.
   - **Reliable delivery fix:** server now tracks a per-`(nick,id,n)` delivery-pending table for *online* recipients and requires the recipient's `ma` (now carrying `n`) to confirm receipt; unconfirmed deliveries retransmit up to 3× (~2s apart) then fall back to the offline queue + evict the stale registry entry. This fixes the reported bug where several messages sent to a client that went silent only redelivered the last one on reconnect — all messages now redeliver (regression test: `test_multi_message_offline_all_delivered_regression`).
   - **History:** local chat history is now also persisted as structured JSONL (`~/.outlaw/history.jsonl`, one JSON object/line for text and image entries) via `append_history`/`load_recent_history`, preloaded (last 200) on launch; `/history [n]` replays it. Both `client.py` and `client_cli.py` wire images, `/open`, `/history`, and history preload identically through the shared `ClientSession`.

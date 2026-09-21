@@ -1,12 +1,15 @@
 # outlaw/ui.py
 import asyncio
+import time
 from datetime import datetime
+from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import Header, Footer, Input, RichLog, Static
 from outlaw.commands import parse_input
-from outlaw import protocol as proto, store
+from outlaw import protocol as proto, store, media
+from outlaw.media import ImageError
 
 BANNER = r"""
  ▄██████▄  ██    ██ ████████ ██       ▄███▄  ██     ██
@@ -32,6 +35,8 @@ class OutlawApp(App):
         self.nick = nick
         self.tunnel_ip = tunnel_ip
         self.history_path = history_path
+        self.jsonl_path = Path(self.history_path).with_suffix(".jsonl") if self.history_path else None
+        self.last_image = None
         self.mode = ("group", None)   # ("group", None) or ("dm", nick)
         self.link_up = False
         self.tx = self.rx = 0
@@ -50,6 +55,12 @@ class OutlawApp(App):
         for line in BANNER.splitlines():
             log.write(f"[#00ff41]{line}[/]")
         log.write("[#666666]> establishing tunnel ...[/]")
+        if self.jsonl_path:
+            for r in store.load_recent_history(self.jsonl_path):
+                if r.get("kind") == "image":
+                    log.write(f"[#666666]{r.get('frm')}: [image {r.get('name')}][/]")
+                else:
+                    log.write(f"[#666666]{r.get('frm')}: {r.get('text', '')}[/]")
         self.query_one("#entry", Input).focus()
         # Start the network session now that widgets are mounted, so early
         # inbound packets can safely update the UI.
@@ -66,6 +77,10 @@ class OutlawApp(App):
 
     def _refresh_status(self):
         self.query_one("#status", Static).update(self._status_text())
+
+    def _log_entry(self, entry):
+        if self.jsonl_path:
+            store.append_history(self.jsonl_path, entry)
 
     def on_input_submitted(self, event: Input.Submitted):
         self.query_one("#entry", Input).value = ""
@@ -105,6 +120,26 @@ class OutlawApp(App):
             self.exit()
         elif kind == "error":
             log.write(f"[#ff3333]! {action['msg']}[/]")
+        elif kind == "img":
+            try:
+                to = "__all__" if self.mode[0] == "group" else self.mode[1]
+                self.session.send_image(to, action["path"])
+                log.write(f"[#ffb000]* sending image → {action['path']}[/]")
+            except ImageError as e:
+                log.write(f"[#ff3333]! {e}[/]")
+        elif kind == "open":
+            target = self.last_image if action["arg"] == "last" else action["arg"]
+            if target and media.open_image(target):
+                log.write(f"[#666666]* opening {target}[/]")
+            else:
+                log.write(f"[#ff3333]! nothing to open[/]")
+        elif kind == "history":
+            rows = store.load_recent_history(self.jsonl_path, action["n"]) if self.jsonl_path else []
+            for r in rows:
+                if r.get("kind") == "image":
+                    log.write(f"[#666666]{r.get('frm')}: [image {r.get('name')}][/]")
+                else:
+                    log.write(f"[#666666]{r.get('frm')}: {r.get('text', '')}[/]")
         self._refresh_status()
 
     def _echo_own(self, to, text):
@@ -112,6 +147,8 @@ class OutlawApp(App):
         tgt = "" if to == "__all__" else f" » {to}"
         self.query_one("#stream", RichLog).write(f"[#ffb000]{ts} {self.nick}{tgt}  {text}[/]")
         store.append_line(self.history_path, f"{ts} {self.nick}{tgt}: {text}")
+        self._log_entry({"ts": int(time.time()), "frm": self.nick, "to": to,
+                          "kind": "text", "text": text})
 
     # --- session callbacks (invoked from asyncio loop; same loop as Textual) ---
     def show_message(self, frm, to, text, ts):
@@ -123,6 +160,21 @@ class OutlawApp(App):
         except NoMatches:
             return
         store.append_line(self.history_path, f"{stamp} {frm}{tag}: {text}")
+        self._log_entry({"ts": int(ts) if ts else int(time.time()), "frm": frm, "to": to,
+                          "kind": "text", "text": text})
+        self._refresh_status()
+
+    def on_image(self, frm, to, path, meta):
+        self.rx += 1
+        tag = "" if to == "__all__" else " » you"
+        try:
+            self.query_one("#stream", RichLog).write(
+                f"[#00ff41]{frm}{tag}  [image saved: {path}] (/open)[/]")
+        except NoMatches:
+            return
+        self.last_image = path
+        self._log_entry({"ts": int(time.time()), "frm": frm, "to": to,
+                          "kind": "image", "path": path, "name": (meta or {}).get("name")})
         self._refresh_status()
 
     def set_roster(self, users):

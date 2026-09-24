@@ -41,6 +41,7 @@ python3 server.py
 Install dependencies and start the client:
 ```bash
 pip install -r requirements.txt
+pkg install python-pillow (If you face error while installing requirements.txt)
 OUTLAW_SERVER=10.0.0.1 python3 client.py
 ```
 
